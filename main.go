@@ -18,6 +18,7 @@ type TodoFile struct {
 	Todos []Todo
 }
 
+// JSON file server 
 func readfile(path string) []byte {
 	data, err := os.ReadFile(path)
 
@@ -82,7 +83,40 @@ func initHandler(w http.ResponseWriter , req *http.Request) {
 	}
 }
 
+
+func middleFunc(nxt http.HandlerFunc) http.HandlerFunc {
+
+	hf := func(w http.ResponseWriter, r *http.Request) {
+        fmt.Println("running the mware")
+        nxt.ServeHTTP(w, r)
+    }
+
+	return hf
+}
+
+func hellofunc(w http.ResponseWriter, rq *http.Request) {
+	fmt.Println("main func logic")
+	fmt.Fprintf(w, "return")
+}
+
+
 func main() {
-	http.HandleFunc("/", initHandler)
+
+	// godotenv.Load()
+	// dbclient := data.ConnectDb()
+
+	// defer func() {
+	// 	if err := dbclient.Disconnect(context.TODO()); err != nil {
+	// 		panic(err)
+	// 	}
+	// }()
+
+
+	// demoDbCall(dbclient)
+
+	loggedHello := middleFunc(hellofunc)
+
+
+	http.HandleFunc("/", loggedHello)
 	http.ListenAndServe(":3000", nil)
 }
