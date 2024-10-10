@@ -1,102 +1,195 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+
+	"github.com/google/uuid"
+	"github.com/rs/cors"
+	"golang.org/x/net/websocket"
 )
 
-type Todo struct {
-	Id    string
-	Title string
-	Done  bool
+type HttpRes struct {
+	Code int 
+	Msg string
 }
 
-type TodoFile struct {
-	Todos []Todo
+type WSMsg struct {
+	MsgType string
+	MsgData string
+	RoomId string
 }
 
-// JSON file server 
-func readfile(path string) []byte {
-	data, err := os.ReadFile(path)
-
-	if err != nil {
-		panic(err)
-	}
-
-	return data
-} 
-
-func convertTodos(bts []byte) []Todo {
-	var jsonData TodoFile	
-
-	json.Unmarshal(bts, &jsonData)
-	fmt.Println(jsonData.Todos)
-
-	return jsonData.Todos
+type Server struct {
+	rooms map[string][]*websocket.Conn
+	conns map[*websocket.Conn]*ConnectionData
 }
 
-func addTodo(todo Todo) {
-	filebytes := readfile("todos.json")
-
-	todoList := convertTodos(filebytes)
-
-	todoList = append(todoList, todo)
-
-	jsonf := TodoFile{
-		Todos: todoList,
-	}
-
-	todoListBytes, err := json.Marshal(jsonf)
-
-	if err != nil {
-		panic(err)
-	}
-
-	os.WriteFile("todos1.json", todoListBytes, os.ModeAppend)
+type ConnectionData struct {
+	room string
+	uid uuid.UUID
+	isconn bool
 }
 
-func initHandler(w http.ResponseWriter , req *http.Request) {
-	if req.Method == "GET" {
-		todos := readfile("todos.json")
-		fmt.Fprintln(w, string(todos))
-	} else {
-		body := req.Body
-		data, err := io.ReadAll(body)
-		if err != nil {
-			panic(err)
-		}
-
-		var todoBody Todo
-
-		json.Unmarshal(data, &todoBody)
-
-		fmt.Println(todoBody)
-
-		// make a db call or something
-
-		addTodo(todoBody)
-
-		fmt.Fprintf(w, "done")
-	}
+type RoomMessage struct {
+	Uid uuid.UUID
+	Text string
 }
 
+type ctxkey struct{}
 
 func middleFunc(nxt http.HandlerFunc) http.HandlerFunc {
-
 	hf := func(w http.ResponseWriter, r *http.Request) {
         fmt.Println("running the mware")
-        nxt.ServeHTTP(w, r)
+
+		var uid = uuid.New()
+		ctx := context.WithValue(r.Context(), ctxkey{}, uid)
+
+        nxt.ServeHTTP(w, r.WithContext(ctx))
     }
 
 	return hf
 }
 
+func wsmware(wsHandler websocket.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		wsHandler.ServeHTTP(w, r)
+	}
+}
+
 func hellofunc(w http.ResponseWriter, rq *http.Request) {
-	fmt.Println("main func logic")
-	fmt.Fprintf(w, "return")
+
+	rs := HttpRes{
+		Code: 200,
+		Msg: "scs",
+	}
+
+	res,err := json.Marshal(rs)
+
+	if err != nil {
+		panic(err)
+	}
+
+	w.Write(res)
+}
+
+func NewServer() *Server {
+	return &Server{
+		rooms: make(map[string][]*websocket.Conn),
+		conns: make(map[*websocket.Conn]*ConnectionData),
+	}
+}
+
+func uidfromwsrq (ws *websocket.Conn) uuid.UUID {
+	return ws.Request().Context().Value(ctxkey{}).(uuid.UUID)
+}
+
+func convertToMsgStream (uid uuid.UUID, txt string) []byte {
+	msg := RoomMessage{
+		Uid: uid,
+		Text: txt,
+	}
+
+	msgstr, err := json.Marshal(msg)
+
+	if err != nil {
+		fmt.Println("Error in converting to msg stream: ", err)
+		return make([]byte, 0)
+	}
+
+	return msgstr
+
+}
+
+func (s *Server) handleWs(ws *websocket.Conn) {
+	// fmt.Println("new conn from client", ws.RemoteAddr())
+	
+	s.conns[ws] = &ConnectionData{
+		room: "",
+		uid: uidfromwsrq(ws),
+		isconn: true,
+	}
+
+	// add a mutex
+
+	defer func() {		
+		// s.conns[ws].isconn = false
+		delete(s.conns, ws)
+		ws.Close()
+	}()
+	
+	s.readLoop(ws)
+}
+
+func (s *Server) readLoop(ws *websocket.Conn) {
+	buff := make([]byte, 1024)
+
+	for {
+		n,err := ws.Read(buff)
+
+		if err != nil {
+
+			if err == io.EOF {
+				break
+			}
+
+			fmt.Println("read err: ", err)
+			continue
+		}
+
+		msg := buff[:n]
+
+		var data WSMsg
+		err = json.Unmarshal(msg, &data)
+
+		fmt.Println(data)
+
+		if err != nil {
+			panic(err)
+		}
+
+		switch {
+			case data.MsgType == "JOIN":
+				s.rooms[data.RoomId] = append(s.rooms[data.RoomId], ws)
+				s.roomSend(data.RoomId, convertToMsgStream(uidfromwsrq(ws), data.MsgData))
+			
+			case data.MsgType == "GLOBALCHAT":
+				s.broadCast(convertToMsgStream(uidfromwsrq(ws), data.MsgData))
+			
+			case data.MsgType == "ROOMCHAT":
+				s.roomSend(data.RoomId, convertToMsgStream(uidfromwsrq(ws), data.MsgData))
+		}
+
+	}
+}
+
+func (s* Server) broadCast (b []byte) {
+	for conn, val:= range s.conns {
+		if val.isconn {
+			go func(){
+				if _, err := conn.Write(b); err != nil {
+					fmt.Println("err in writing: ", err)
+				}
+			}()
+		}
+	}
+}
+
+func (s *Server) roomSend (roomid string, b []byte) {
+	for _,conn := range s.rooms[roomid] {
+		cdata := s.conns[conn]
+
+		if cdata.isconn {
+			go func(){
+				if _, err := conn.Write(b); err != nil {
+					fmt.Println("err in writing: ", err)
+				}
+			}()
+		}
+	} 
 }
 
 
@@ -114,9 +207,19 @@ func main() {
 
 	// demoDbCall(dbclient)
 
+	c := cors.New(cors.Options{
+        AllowedOrigins:   []string{"*"}, // You can specify allowed origins here
+        AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+        AllowedHeaders:   []string{"Authorization", "Content-Type"},
+        AllowCredentials: true,
+    })
+
+
 	loggedHello := middleFunc(hellofunc)
-
-
-	http.HandleFunc("/", loggedHello)
+	http.Handle("/", c.Handler(loggedHello))
+	
+	svr := NewServer()
+	
+	http.Handle("/ws", c.Handler(middleFunc(wsmware(websocket.Handler(svr.handleWs)))))
 	http.ListenAndServe(":3000", nil)
 }
